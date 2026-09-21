@@ -4,6 +4,7 @@
 #include <string.h>
 #include <time.h>
 #include <inttypes.h>
+#include <math.h>
 
 #ifdef _WIN32
 #define STRICMP _stricmp
@@ -13,6 +14,11 @@
 #endif
 
 #define INVALID_OFFSET 0xFFFFFFFF
+#define ENTROPY_PACKED_THRESHOLD 7.0
+#define ANOMALY_ENTROPY_THRESHOLD 7.5
+#define SCN_MEM_EXECUTE 0x20000000
+#define SCN_MEM_WRITE   0x80000000
+#define BANNER_WIDTH 70 // matches the 70-char "====" separator used everywhere else in the report
 
 #pragma pack(push, 1)
 
@@ -107,6 +113,61 @@ typedef struct {
 
 #pragma pack(pop)
 
+double calculate_entropy(FILE* file, uint32_t offset, uint32_t size) {
+    if (size == 0 || offset == 0) return 0.0;
+
+    uint64_t byte_counts[256] = {0};
+    uint8_t buffer[4096];
+    uint32_t bytes_read = 0;
+
+    if (fseek(file, offset, SEEK_SET) != 0) return 0.0;
+
+    while (bytes_read < size) {
+        uint32_t to_read = (size - bytes_read > sizeof(buffer)) ? sizeof(buffer) : (size - bytes_read);
+        size_t read_count = fread(buffer, 1, to_read, file);
+        if (read_count == 0) break;
+
+        for (size_t i = 0; i < read_count; i++) {
+            byte_counts[buffer[i]]++;
+        }
+        bytes_read += (uint32_t)read_count;
+    }
+
+    if (bytes_read == 0) return 0.0;
+
+    double entropy = 0.0;
+    for (int i = 0; i < 256; i++) {
+        if (byte_counts[i] > 0) {
+            double p = (double)byte_counts[i] / bytes_read;
+            entropy -= p * (log(p) / log(2.0));
+        }
+    }
+
+    return entropy;
+}
+
+void print_banner_border(void) {
+    putchar('+');
+    for (int i = 0; i < BANNER_WIDTH - 2; i++) putchar('=');
+    putchar('+');
+    putchar('\n');
+}
+
+void print_banner_line(const char* text) {
+    int len = (int)strlen(text);
+    int pad = BANNER_WIDTH - 2 - len;
+    if (pad < 0) pad = 0;
+    int left = pad / 2;
+    int right = pad - left;
+
+    putchar('|');
+    for (int i = 0; i < left; i++) putchar(' ');
+    printf("%s", text);
+    for (int i = 0; i < right; i++) putchar(' ');
+    putchar('|');
+    putchar('\n');
+}
+
 const char* get_machine_type(uint16_t machine) {
     switch (machine) {
         case 0x8664: return "x64 (AMD64)";
@@ -126,7 +187,27 @@ void parse_characteristics(uint16_t chars) {
     printf("]\n");
 }
 
-void parse_optional_header_details(OPTIONAL_HEADER64* opt, SECTION_HEADER* sections, uint16_t num_sections) {
+
+int detect_entry_point_anomaly(OPTIONAL_HEADER64* opt, SECTION_HEADER* sections, uint16_t num_sections) {
+    for (int i = 0; i < num_sections; i++) {
+        uint32_t start = sections[i].VirtualAddress;
+        uint32_t end = start + sections[i].VirtualSize;
+
+        if (opt->AddressOfEntryPoint >= start && opt->AddressOfEntryPoint < end) {
+            char sec_name[9] = {0};
+            memcpy(sec_name, sections[i].Name, 8);
+            return STRICMP(sec_name, ".text") != 0;
+        }
+    }
+    return 1;
+}
+
+int detect_tls_present(OPTIONAL_HEADER64* opt) {
+    return (opt->DataDirectory[9].VirtualAddress != 0 || opt->DataDirectory[9].Size != 0);
+}
+
+int parse_optional_header_details(OPTIONAL_HEADER64* opt, SECTION_HEADER* sections, uint16_t num_sections) {
+    int entry_point_anomaly = 0;
     printf("\n======================================================================\n");
     printf("OPTIONAL HEADER ANALYSIS & MITIGATIONS\n");
     printf("======================================================================\n");
@@ -161,6 +242,7 @@ void parse_optional_header_details(OPTIONAL_HEADER64* opt, SECTION_HEADER* secti
             
             if (STRICMP(sec_name, ".text") != 0) {
                 printf("  |-- [!] CRITICAL: Entry Point is NOT in .text section! (Packer / Code Injection Flag!)\n");
+                entry_point_anomaly = 1;
             }
             found_sec = 1;
             break;
@@ -168,6 +250,7 @@ void parse_optional_header_details(OPTIONAL_HEADER64* opt, SECTION_HEADER* secti
     }
     if (!found_sec) {
         printf("Entry Point Section     : [!] UNKNOWN (Entry Point points outside valid sections!)\n");
+        entry_point_anomaly = 1;
     }
 
     // DllCharacteristics Flag Check
@@ -178,9 +261,13 @@ void parse_optional_header_details(OPTIONAL_HEADER64* opt, SECTION_HEADER* secti
     printf("  |-- HIGH_ENTROPY_VA     : %s\n", (dll_char & 0x0020) ? "ENABLED" : "DISABLED");
     printf("  |-- Guard CF            : %s\n", (dll_char & 0x4000) ? "ENABLED" : "DISABLED");
     printf("  |-- Terminal Server     : %s\n", (dll_char & 0x8000) ? "AWARE" : "NO");
+
+    return entry_point_anomaly;
 }
 
-void parse_data_directories_details(OPTIONAL_HEADER64* opt) {
+int parse_data_directories_details(OPTIONAL_HEADER64* opt) {
+    int tls_present = 0;
+
     printf("\n======================================================================\n");
     printf("DATA DIRECTORIES (CRITICAL INDEXES)\n");
     printf("======================================================================\n");
@@ -218,8 +305,9 @@ void parse_data_directories_details(OPTIONAL_HEADER64* opt) {
                 
                 if (i == 4) { 
                     printf(" -> [!] Authenticode Signature Found!");
-                } else if (i == 9) { 
+                } else if (i == 9) {
                     printf(" -> [!] CRITICAL: TLS Callback Present (Anti-Debug/Early Exec)!");
+                    tls_present = 1;
                 } else if (i == 2 && size > 0x10000) { // Devasa .rsrc
                     printf(" -> [!] WARNING: Large Resource Section (Possible Embedded Payload)!");
                 }
@@ -227,6 +315,8 @@ void parse_data_directories_details(OPTIONAL_HEADER64* opt) {
             }
         }
     }
+
+    return tls_present;
 }
 
 
@@ -447,9 +537,13 @@ int main(int argc, char* argv[]) {
         strcpy(time_str, "Unknown Date");
     }
 
-    printf("======================================================================\n");
-    printf("PE-INFO PARSER: %s\n", argv[1]);
-    printf("======================================================================\n");
+    print_banner_border();
+    print_banner_line("");
+    print_banner_line("PE-INFO PARSER");
+    print_banner_line("Static PE Triage & Anomaly Analysis");
+    print_banner_line("");
+    print_banner_border();
+    printf("Target File             : %s\n", argv[1]);
     printf("Machine                 : 0x%04X -> %s\n", file_hdr.Machine, get_machine_type(file_hdr.Machine));
     printf("Number of Sections      : %d\n", file_hdr.NumberOfSections);
     printf("Compilation Date (Stamp): %s\n", time_str);
@@ -473,17 +567,73 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    printf("%-10s %-12s %-12s %-12s %-12s\n", "SECTION NAME", "VIRT_SIZE", "VIRT_ADDR(RVA)", "RAW_OFFSET", "PERMISSIONS");
+    double* entropies = malloc(sizeof(double) * file_hdr.NumberOfSections);
+    int* rwx_flags = malloc(sizeof(int) * file_hdr.NumberOfSections);
+    if (!entropies || !rwx_flags) {
+        printf("[-] Error: Could not allocate memory for section analysis!\n");
+        free(sections);
+        free(entropies);
+        free(rwx_flags);
+        fclose(file);
+        return 1;
+    }
+
+    int any_rwx_section = 0;
+    int any_high_entropy_anomaly = 0;
+
+    for (int i = 0; i < file_hdr.NumberOfSections; i++) {
+        entropies[i] = calculate_entropy(file, sections[i].PointerToRawData, sections[i].SizeOfRawData);
+        rwx_flags[i] = (sections[i].Characteristics & SCN_MEM_EXECUTE) && (sections[i].Characteristics & SCN_MEM_WRITE);
+
+        if (rwx_flags[i]) any_rwx_section = 1;
+        if (entropies[i] > ANOMALY_ENTROPY_THRESHOLD) any_high_entropy_anomaly = 1;
+    }
+
+    int entry_point_anomaly = detect_entry_point_anomaly(&opt_hdr, sections, file_hdr.NumberOfSections);
+    int tls_present = detect_tls_present(&opt_hdr);
+    int is_suspicious = any_high_entropy_anomaly || any_rwx_section || entry_point_anomaly || tls_present;
+
+
+    printf("======================================================================\n");
+    printf("PE TRIAGE ANOMALY SUMMARY\n");
+    printf("======================================================================\n");
+    printf("High Entropy Section (>%.1f) : %s\n", ANOMALY_ENTROPY_THRESHOLD, any_high_entropy_anomaly ? "YES" : "no");
+    printf("RWX Section Present          : %s\n", any_rwx_section ? "YES" : "no");
+    printf("Entry Point Anomaly          : %s\n", entry_point_anomaly ? "YES" : "no");
+    printf("TLS Callback Present         : %s\n", tls_present ? "YES" : "no");
+    printf("----------------------------------------------------------------------\n");
+    if (is_suspicious) {
+        printf("Verdict: [!] SUSPICIOUS -> KERNEL32 baseline suppression DISABLED, every import shown below.\n\n");
+    } else {
+        printf("Verdict: [OK] No composite anomaly signal -> KERNEL32 noise suppression stays active.\n\n");
+    }
+
+    printf("%-10s %-12s %-12s %-12s %-12s %s\n", "SECTION NAME", "VIRT_SIZE", "VIRT_ADDR(RVA)", "RAW_OFFSET", "PERMISSIONS", "ENTROPY");
     printf("----------------------------------------------------------------------\n");
 
     for (int i = 0; i < file_hdr.NumberOfSections; i++) {
         char sec_name[9] = {0};
         memcpy(sec_name, sections[i].Name, 8);
 
-        printf("%-10s 0x%08X   0x%08X     0x%08X   0x%08X\n", 
-               sec_name, sections[i].VirtualSize, sections[i].VirtualAddress, 
-               sections[i].PointerToRawData, sections[i].Characteristics);
+        printf("%-10s 0x%08X   0x%08X     0x%08X   0x%08X   %.2f",
+               sec_name, sections[i].VirtualSize, sections[i].VirtualAddress,
+               sections[i].PointerToRawData, sections[i].Characteristics, entropies[i]);
+
+        if (entropies[i] > ENTROPY_PACKED_THRESHOLD) {
+            printf("  [!] HIGH (Packed / Encrypted?)");
+        }
+        if (rwx_flags[i]) {
+            printf("  [!] RWX (Write+Execute)");
+        }
+        printf("\n");
     }
+
+    if (any_rwx_section) {
+        printf("[!] WARNING: At least one section is Read+Write+Execute! (Self-modifying / unpacking-stub pattern)\n");
+    }
+
+    free(entropies);
+    free(rwx_flags);
 
     parse_optional_header_details(&opt_hdr, sections, file_hdr.NumberOfSections);
     parse_data_directories_details(&opt_hdr);
@@ -560,8 +710,10 @@ int main(int argc, char* argv[]) {
                                     if (is_kernel32) {
                                         if (is_critical_kernel32_api(func_name)) {
                                             printf("    |-- [!] CRITICAL API: %s\n", func_name);
-                                        } else if (is_crt_baseline_api(func_name)) {
+                                        } else if (!is_suspicious && is_crt_baseline_api(func_name)) {
                                             printf("    |-- [~] CRT Baseline: %s\n", func_name);
+                                        } else if (is_suspicious) {
+                                            printf("    |-- [?] API (baseline suppression disabled - binary flagged): %s\n", func_name);
                                         } else {
                                             hidden_k32_count++;
                                         }
